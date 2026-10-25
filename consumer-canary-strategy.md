@@ -40,7 +40,7 @@ On top of that:
 - Add gradual exposure on the consumer side by flipping **one consumer group at a time**, downstream consumers before upstream ones, with an optional **partition-level canary** for high-risk groups.
 - Keep **shadow consumption** for high-risk consumer-logic releases and **versioned topics** for genuinely breaking schema changes. Per-message cohort routing is not recommended as the default; its complexity isn't justified by these requirements.
 - Rolling consumers back after the API canary has started needs either proven forward compatibility or an **offset fence**: wait until Green has consumed everything Green's API produced before handing partitions back to Blue.
-- Containers start and stop at any point (autoscaling, replacement, host events, deployments). The design stays correct because a container's role is computed at runtime from the control item, its color and its **deployment id**; containers from any other deployment run no consumers; Kafka membership is re-checked after a settle window; and the orchestrator sets **capacity floors and scaling suspensions** for both colors in every phase (section 9).
+- Containers start and stop at any point (autoscaling, replacement, host events, deployments). The design stays correct because a container's role is computed at runtime from the control item and its color; only the pipeline can change a color's service, and the orchestrator checks in ECS that each color runs the expected build before every step; Kafka membership is re-checked after a settle window; and the orchestrator sets **capacity floors and scaling suspensions** for both colors in every phase (section 9).
 
 ---
 
@@ -82,7 +82,7 @@ These are non-negotiable; every mechanism below exists to enforce one of them.
 | I4 | A color's API receives weighted production traffic only after its consumers own every functional group it produces to — or forward compatibility has been proven. |
 | I5 | Every consumer is idempotent under redelivery. |
 | I6 | Rollout state changes only through the orchestrator. Humans act through the orchestrator, not by editing DynamoDB or Route 53 directly. |
-| I7 | A container's role is derived at runtime from the control item, its color and its deployment id. A container whose deployment id isn't the one recorded for its color is an orphan and runs no consumers. |
+| I7 | A container's role is derived at runtime from the control item and its color. During a rollout each color's service runs exactly one task definition, which only the orchestrator can change. |
 | I8 | During a rollout, the orchestrator sets capacity floors and scaling suspensions for both colors; autoscaling operates inside them. |
 
 ---
@@ -113,9 +113,9 @@ Two rules follow from this table and drive the rest of the document:
 
 | Step | Assessment | Gap | Hardening |
 |---|---|---|---|
-| **1. Stack-aware application** | Necessary. | Colors alternate; any logic that assumes "Green = new" breaks on the next release. Making color a Spring profile invites config drift between colors. | Inject color and deployment id as environment variables. Use them only for identity and for evaluating the control item. Live/candidate roles live in DynamoDB. |
+| **1. Stack-aware application** | Necessary. | Colors alternate; any logic that assumes "Green = new" breaks on the next release. Making color a Spring profile invites config drift between colors. | Inject color and a per-rollout deployment id as environment variables. Color drives identity and the evaluation of the control item; the deployment id only names per-rollout test groups and tags metrics. Live/candidate roles live in DynamoDB. |
 | **2. New stack subscribes only to the test topic** | The correct gate: no production record reaches N before tests pass. | Which consumer group? If acceptance subscriptions share the functional group id, or Blue also consumes the test topic in the same group, test records split across colors. A single shared test topic also means Green's acceptance wiring differs from its functional wiring. | Ephemeral per-deployment acceptance groups. One acceptance topic per functional topic (or a header-tagged logical topic). Same listener beans and container factory as the functional path. |
-| **3. Acceptance tests + old-stack traffic** | The key backward-compatibility check, run against real N-1 binaries. | Blue's API produces to *functional* topics unless N-1 already knows how to route test requests elsewhere. Sending "a percentage of test traffic" through weighted Route 53 also mixes it with real users. | A test-routing contract shipped in N-1; the test harness calls per-color endpoints directly; records are addressed to a target deployment id. |
+| **3. Acceptance tests + old-stack traffic** | The key backward-compatibility check, run against real N-1 binaries. | Blue's API produces to *functional* topics unless N-1 already knows how to route test requests elsewhere. Sending "a percentage of test traffic" through weighted Route 53 also mixes it with real users. | A test-routing contract shipped in N-1; the test harness calls per-color endpoints directly; records are addressed to a target color. |
 | **4. Dynamic flip** | The right mechanism: config-driven, fast, reversible. | "Simultaneously" is a race between independent pollers, so you get overlap or a gap depending on timing. Flipping all groups at once is a 0→100% jump for consumers. Nothing verifies that Blue actually left the groups. | Versioned control item; per-group drain → verify (Kafka AdminClient) → start; risk-ordered group sequence; optional overlap as a partition canary. |
 | **5. Route 53 ramp** | Correct ordering: consumers first. | Handing consumers back to Blue after Green's API has produced messages requires Blue to read N's messages (forward compatibility), which the plan doesn't test. DNS weighting is approximate. | Add a Green→Blue leg to the acceptance matrix, or use the offset-fence rollback. Measure the real traffic split from LB metrics. |
 
@@ -128,7 +128,7 @@ The pipeline injects two values per stack. Both colors run the **same artifact w
 ```yaml
 deployment:
   color: ${STACK_COLOR}                 # blue | green, injected by the pipeline
-  deployment-id: ${DEPLOYMENT_ID}       # unique per rollout, e.g. d-20261026-7f3c
+  deployment-id: ${DEPLOYMENT_ID}       # unique per rollout; names test groups and tags metrics only
   stack-id: ${STACK_ID}                 # e.g. prod#ap-south-1#stack-a
   control:
     table: ${CONSUMER_CONFIG_TABLE}
@@ -183,8 +183,8 @@ Extend the existing consumer-config table with a control item, and keep instance
   "rev": 118,
   "phase": "CONSUMER_CUTOVER",
   "stacks": {
-    "BLUE":  { "deploymentId": "d-20261019-41aa", "build": "4.12.0", "role": "LIVE" },
-    "GREEN": { "deploymentId": "d-20261026-7f3c", "build": "4.13.0", "role": "CANDIDATE" }
+    "BLUE":  { "build": "4.12.0", "role": "LIVE" },
+    "GREEN": { "build": "4.13.0", "role": "CANDIDATE" }
   },
   "ownership": {
     "audit-events":   { "owner": "GREEN" },
@@ -210,7 +210,6 @@ Extend the existing consumer-config table with a control item, and keep instance
 {
   "pk": "STATUS#prod#ap-south-1#stack-a",
   "sk": "INSTANCE#GREEN#i-0a1b2c3d",
-  "deploymentId": "d-20261026-7f3c",
   "observedRev": 118,
   "running": ["audit-events:FUNCTIONAL", "order-events:FUNCTIONAL", "order-events:ACCEPTANCE"],
   "heartbeatAt": "2026-10-26T06:10:04Z",
@@ -222,8 +221,8 @@ Rules for the model:
 
 - **Conditional writes.** The orchestrator writes the control item with `ConditionExpression: rev = :expected` and increments `rev`, so two pipelines can never interleave.
 - **Region-local writes.** If the table is a global table, key control items by region and write them only in their own region. Global-table replication is asynchronous with last-writer-wins, so a cross-region write race could silently revert a flip.
-- **Single derivation.** Each instance's desired state is a pure function of (control item, consumer config items, its own color and deployment id). Nothing else.
-- **Deployment-id fencing.** Ownership names a color, but a container acts on it only if its own deployment id equals `stacks.<color>.deploymentId`. The orchestrator writes the candidate's deployment id before launching any candidate container (section 9.2).
+- **Single derivation.** Each instance's desired state is a pure function of (control item, consumer config items, its own color). Nothing else.
+- **Informational fields.** `build` and `role` are for the orchestrator and humans; containers don't act on them. Which build a color runs is the platform's job (section 9.2).
 
 #### 4.2.3 Propagating changes
 
@@ -265,11 +264,6 @@ class ConsumerReconciler {
 final class DesiredState {
 
     static Map<String, ContainerSpec> compute(Snapshot s, StackIdentity me) {
-        // Deployment-id fencing (section 9.2): only the deployment recorded for this color acts on
-        // its ownership. Old tasks, stray restarts and task-definition drift become orphans.
-        if (!me.deploymentId().equals(s.deploymentIdOf(me.color()))) {
-            return Map.of();
-        }
         Map<String, ContainerSpec> out = new LinkedHashMap<>();
         for (ConsumerConfig c : s.consumers()) {
             if (!c.enabled()) continue;
@@ -287,14 +281,14 @@ final class DesiredState {
 }
 
 record ContainerSpec(String key, String consumerName, String groupId, List<String> topics,
-                     String clientId, int concurrency, boolean acceptance, String deploymentId) {
+                     String clientId, int concurrency, boolean acceptance, String color) {
 
     static ContainerSpec functional(ConsumerConfig c, StackIdentity me, OptionalInt override) {
         return new ContainerSpec(c.name() + ":FUNCTIONAL", c.name(),
                 c.groupId(),                                           // identical on both colors
                 c.topics(),
                 me.service() + "-" + me.color().id() + "-" + c.name(),
-                override.orElse(c.concurrency()), false, me.deploymentId());
+                override.orElse(c.concurrency()), false, me.color().id());
     }
 
     static ContainerSpec acceptance(ConsumerConfig c, StackIdentity me) {
@@ -302,7 +296,7 @@ record ContainerSpec(String key, String consumerName, String groupId, List<Strin
                 c.groupId() + ".acc." + me.color().id() + "." + me.deploymentId(),   // ephemeral
                 c.topics().stream().map(t -> t + ".acceptance").toList(),
                 me.service() + "-" + me.color().id() + "-" + c.name() + "-acc",
-                1, true, me.deploymentId());
+                1, true, me.color().id());
     }
 }
 ```
@@ -342,9 +336,9 @@ class ConsumerContainerManager implements SmartLifecycle {
 
         MessageListener<String, byte[]> listener = listeners.forConsumer(spec.consumerName());
         if (spec.acceptance()) {
-            // Discard test records addressed to another deployment; ack them so offsets advance.
+            // Discard test records addressed to the other color; ack them so offsets advance.
             listener = new FilteringMessageListenerAdapter<>(listener,
-                    rec -> !spec.deploymentId().equals(header(rec, "x-test-target")), true);
+                    rec -> !spec.color().equalsIgnoreCase(header(rec, "x-test-target")), true);
             c.setRecordInterceptor(new TestContextInterceptor());   // propagates test context downstream
         } else {
             c.setRecordInterceptor(new TestLeakQuarantine());       // functional path rejects test records
@@ -402,13 +396,13 @@ Implementation notes:
 - Keep drain time bounded: container-managed ack modes commit on revocation and on stop; `max.poll.records` × worst-case per-record time must stay under the stop timeout. Verify the commit-on-stop behavior for the ack mode you use.
 - Adapt the listener wrapping if you use batch or acknowledging listeners.
 - `converge` is idempotent and runs every poll, so a container that died is restarted and a spec change in DynamoDB (topics, concurrency) is applied without redeploying.
-- Deployment-id fencing, the ownership guard and the shutdown ordering exist because containers come and go throughout a rollout; section 9 explains each.
+- The ownership guard and the shutdown ordering exist because containers come and go throughout a rollout; section 9 explains each.
 
 #### 4.2.5 Flip protocol for one consumer group
 
 **Default: break-before-make**
 
-1. **Preconditions.** Acceptance and the compatibility matrix passed; Green is pre-scaled and capacity floors are set (section 9.5); every Green container reports the candidate deployment id and the current `rev`, with no orphans; the group has had no rebalance for a short stability window; the control plane is healthy.
+1. **Preconditions.** Acceptance and the compatibility matrix passed; Green is pre-scaled and capacity floors are set (section 9.5); the Green service runs only the expected task definition (checked in ECS) and every Green container reports the current `rev`; the group has had no rebalance for a short stability window; the control plane is healthy.
 2. Orchestrator sets `ownership[g].owner = NONE` (rev r+1).
 3. Blue reconcilers stop g's functional containers: finish in-flight records, commit, leave the group.
 4. Orchestrator verifies **with Kafka** that `describeConsumerGroups(g)` has zero members, and that all Blue instances report `observedRev ≥ r+1`. It then waits a **settle window** (at least one poll interval plus container start time) and checks again, which catches a Blue container that started from a stale read just before step 2. If static membership is in use, it removes the stopped Blue members explicitly (section 9.8). On timeout (e.g. 2 minutes, and never shorter than `session.timeout.ms`), restore `BLUE` and abort.
@@ -435,10 +429,10 @@ For groups that can't tolerate the pause, or that you want to canary on real tra
 | Situation | Behavior | Mitigation |
 |---|---|---|
 | DynamoDB unreachable | Instances fail static | Alarm; orchestrator does not advance without fresh heartbeats. |
-| Autoscaling launches an instance mid-flip | It reads the current `rev`, passes deployment-id fencing and joins the correct state | The ownership guard and the settle window cover a stale read (section 9.6). |
+| Autoscaling launches an instance mid-flip | It reads the current `rev` and joins the correct state | The ownership guard and the settle window cover a stale read (section 9.6). |
 | A container is killed mid-drain (SIGKILL, OOM, host loss) | No commit; its partitions stay assigned until `session.timeout.ms` | The orchestrator waits at least the session timeout before aborting; idempotency handles redelivered records. |
 | Static members stop | They don't leave the group, so partitions stay held until the session times out | Remove the members via AdminClient during handover, or don't use static membership for these groups (section 9.8). |
-| A container from another deployment starts (old task, circuit-breaker rollback, out-of-band change) | Deployment-id mismatch: orphan, no consumers | Orphan alarm; abort the rollout if the candidate color has orphans. |
+| A color's service changes outside the orchestrator (manual update, ECS circuit-breaker rollback) | New tasks run a build the orchestrator didn't validate | Only the pipeline role can update color services; the orchestrator watches ECS deployment events and aborts (section 9.2). |
 | A Blue instance does not drain (stuck handler, or cut off from DynamoDB but not Kafka) | Kafka still shows a Blue member in g | Timeout → abort, or the orchestrator terminates that instance and re-verifies. |
 | Green crash-loops after taking g | Lag rises, members churn | Automatic rollback of g to `BLUE`; same group, so offsets continue. |
 | Poison message after the flip | Green's error handler routes it to a DLT | `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`; DLT rate is a gate metric. |
@@ -597,7 +591,7 @@ Rolling instances in the same group with no explicit gate. It's included in the 
 | Handles breaking schema changes | No | No | No | Partly (detects them) | No | **Yes** |
 | Fit with DynamoDB consumer config | N/A | Native | Good (`BOTH` + concurrency) | Good (shadow container type) | Possible (p in config) | Topics per version |
 | Coordination with Route 53 API canary | None | Good (consumer-first) | Independent; precedes API ramp | Precedes API ramp | Excellent (same cohort) | Neutral |
-| Robustness to container churn and autoscaling | Version mix depends on which tasks get replaced | Good with deployment-id fencing, ownership guard and capacity floors | Poor: canary share drifts with every join or leave | Good if shadow mode is container-scoped | Best for membership churn; fragile to stale config | Good; bridge churn adds lag |
+| Robustness to container churn and autoscaling | Version mix depends on which tasks get replaced | Good with the ownership guard and capacity floors | Poor: canary share drifts with every join or leave | Good if shadow mode is container-scoped | Best for membership churn; fragile to stale config | Good; bridge churn adds lag |
 
 **When to use each**
 
@@ -655,9 +649,9 @@ Optional: shadow consumption (Strategy B) for releases the pipeline flags as hig
 
 | Hop | Behavior |
 |---|---|
-| API request | Carries `X-Test-Run-Id` and `X-Test-Target` (the deployment id of the stack that should consume the result). Accepted only from an authenticated test principal (mTLS client, IAM role or allow-listed client id); ignored otherwise. |
+| API request | Carries `X-Test-Run-Id` and `X-Test-Target` (the color whose consumers should process the result). Accepted only from an authenticated test principal (mTLS client, IAM role or allow-listed client id); ignored otherwise. |
 | Producer | A single publisher choke point resolves `<topic>` → `<topic>.acceptance` when a test context is present and copies `x-test-run-id` and `x-test-target` onto the record. |
-| Acceptance consumer | Discards records whose `x-test-target` isn't its own deployment id. A `RecordInterceptor` re-establishes the test context, so anything it produces downstream also goes to acceptance topics with the same headers. |
+| Acceptance consumer | Discards records whose `x-test-target` isn't its own color. Because each rollout creates fresh acceptance groups that start at `latest`, records targeted at the same color in earlier rollouts are never read. A `RecordInterceptor` re-establishes the test context, so anything it produces downstream also goes to acceptance topics with the same headers. |
 | Async boundaries | Propagate the test context through `@Async` executors (`TaskDecorator`) and any other thread hand-offs. |
 
 ```java
@@ -675,7 +669,7 @@ public class RoutingKafkaPublisher {
         ProducerRecord<String, byte[]> record = new ProducerRecord<>(topic, key, payload);
         if (test != null) {
             record.headers().add("x-test-run-id", test.runId().getBytes(UTF_8));
-            record.headers().add("x-test-target", test.targetDeploymentId().getBytes(UTF_8));
+            record.headers().add("x-test-target", test.targetColor().getBytes(UTF_8));
         }
         assertNoLeak(record);
         return template.send(record);
@@ -695,7 +689,7 @@ Enforce the guard in this choke point rather than in a Kafka `ProducerIntercepto
 
 **Leak guards, both directions.** Functional containers use a `RecordInterceptor` that quarantines any record carrying `x-test-run-id` (skip, publish to a quarantine topic, increment an alarmed counter). The counter must stay at zero.
 
-**Driving traffic.** The harness calls **per-color endpoints** (each color's internal LB DNS name), never the weighted Route 53 name. For M1 it calls Blue's API with `X-Test-Target` set to Green's deployment id; for M3 it calls Green's API targeting Blue's deployment id. Both deployment ids come from the control item. The "small percentage of test traffic on the old stack" in the original plan becomes this: synthetic, targeted calls, not a slice of user traffic.
+**Driving traffic.** The harness calls **per-color endpoints** (each color's internal LB DNS name), never the weighted Route 53 name. For M1 it calls Blue's API with `X-Test-Target: green`; for M3 it calls Green's API with `X-Test-Target: blue`. The "small percentage of test traffic on the old stack" in the original plan becomes this: synthetic, targeted calls, not a slice of user traffic.
 
 **Assertions.** Poll Green's read APIs (or the datastore) by test-run id with a time box. Fail the gate on any deserialization error, DLT publish or timeout.
 
@@ -716,7 +710,7 @@ Enforce the guard in this choke point rather than in a Kafka `ProducerIntercepto
 11. **Unique client identity per color**: `client.id`, `group.instance.id` and `transactional.id` prefix all include color.
 12. **Same artifact and config on both colors.** Color selects identity and ownership only.
 13. **Schema compatibility enforced at registration,** transitively.
-14. **Deployment-id fencing.** A container acts on ownership only if its deployment id matches the control item; orphans run no consumers.
+14. **One build per color during a rollout.** Only the pipeline role can update a color's service; the orchestrator verifies the running task definition in ECS before every step.
 15. **No churn hazards in client identity.** Avoid static membership on groups that change owner (or remove members at handover), and use stable transactional-id slots rather than per-container ids (section 9.8).
 
 ---
@@ -727,7 +721,7 @@ Enforce the guard in this choke point rather than in a Kafka `ProducerIntercepto
 
 | Phase | Kafka consumers | API weights (Blue / Green) | Exit gate |
 |---|---|---|---|
-| **P0 Provision** | Orchestrator records Blue's capacity baseline and Green's deployment id, then launches Green; no functional containers; acceptance groups created | 100 / 0 | Green at its target count; every Green container reports the candidate deployment id and the current `rev`; no orphans. |
+| **P0 Provision** | Orchestrator records Blue's capacity baseline, then launches Green; no functional containers; acceptance groups created | 100 / 0 | Green's ECS deployment has completed with only the new task definition running, at its target count; every Green container reports the current `rev`. |
 | **P1 Acceptance** | Green: acceptance. Blue: functional + acceptance (for M3). | 100 / 0 (test traffic to per-color endpoints) | Acceptance suite + M1, M2 (and M3 if adopted) pass. |
 | **P2 Consumer canary** | Green pre-scaled to Blue's consumer capacity and Blue scale-in suspended; then groups flipped to Green one at a time, sinks first; partition canary for high-risk groups | 100 / 0 | Per-group lag, error and DLT rate, and business KPIs within thresholds for the bake window. |
 | **P3 Consumer cutover complete** | Green owns every group; Blue consumers off, instances warm | 100 / 0 | Stack-level bake. |
@@ -756,7 +750,7 @@ sequenceDiagram
     G->>D: Poll control item, report observed rev
     G->>K: Join acceptance groups on *.acceptance topics
     O->>K: Wait until acceptance groups fully assigned
-    O->>B: Test calls via Blue endpoint, X-Test-Target = Green deployment
+    O->>B: Test calls via Blue endpoint, X-Test-Target = green
     B->>K: Produce to *.acceptance with test headers
     K->>G: Deliver, Green processes (M1)
     O->>G: Test calls via Green endpoint (M2, M3)
@@ -842,27 +836,30 @@ Both applications run in containers, and containers start and stop at every poin
 ### 9.1 Principles
 
 1. **Late joiners converge.** A container that starts at any moment reaches the same state as one that has been running all along, because its role is computed from the control item rather than pushed to the containers that existed at the time.
-2. **Identity comes from the color's service; role comes from the control item.** Color and deployment id are fixed in the color's task definition and never change during a container's life.
+2. **Identity comes from the color's service; role comes from the control item.** Color is fixed in the color's task definition and never changes during a container's life; which build that service runs is controlled by the pipeline, not by containers.
 3. **Kafka is the referee.** A handover is complete when Kafka's view of group membership says so, checked twice across a settle window.
 4. **Graceful when possible, correct when not.** The SIGTERM path commits and flushes; the SIGKILL path relies on redelivery and idempotency.
 5. **The orchestrator owns capacity during a rollout.** Autoscaling keeps working, but inside floors and suspensions the orchestrator sets for each phase.
 
-### 9.2 Container identity and orphans
+### 9.2 Container identity and build consistency
 
-- Each color in each stack is its own service (an ECS service or a Kubernetes Deployment). `STACK_COLOR` and `DEPLOYMENT_ID` are set in that service's task definition or pod template, so every container it launches (initial, scaled out or replacement) carries the same identity.
-- Before launching any candidate container, the orchestrator writes the candidate's deployment id into `stacks.<color>.deploymentId`.
-- **Deployment-id fencing.** A container acts on ownership and acceptance flags only when its deployment id matches the one recorded for its color. Otherwise it is an **orphan**: it runs no consumers, fails its LB readiness check once the mismatch is confirmed, marks itself as an orphan in its status item, and raises an alarm. A container that simply can't reach DynamoDB isn't an orphan; it serves the API and waits (section 9.3).
-- **Why color alone isn't enough.** Colors are reused every other release. Without fencing, an N-1 Blue container still alive when Blue next becomes owner, or one restarted by the platform from an old task definition, would join functional groups with stale code.
-- **Sources of orphans:** old tasks still being replaced when a color is redeployed, an ECS deployment circuit breaker rolling a service back to its previous task definition, out-of-band changes to a color's service, and stray restarts of a retired color.
-- **A mid-rollout change to a color's service is a new rollout.** A hotfix, a config or secret change that produces a new task-definition revision, or a circuit-breaker rollback all create containers with a new deployment id. The orchestrator treats this as an abort: hand groups back to Blue if Green owns any, set API weight back to Blue, and restart from P0 with the new deployment id. A fix that can't wait goes through the same pipeline with shortened bake windows.
+- Each color in each stack is its own service (an ECS service or a Kubernetes Deployment), with `STACK_COLOR` set in its task definition or pod template. Every container the service launches (initial, scaled out or replacement) runs the service's current task definition, so color plus the service's task definition fully identifies the build. Containers don't need to know or check which build their color is supposed to run.
+- The `DEPLOYMENT_ID` environment variable only names per-rollout acceptance and shadow groups and tags metrics. It isn't stored in DynamoDB and containers don't compare it against anything.
+- **Why the control item doesn't track builds.** A per-build check in DynamoDB would only guard against a color's service running something the orchestrator didn't validate. The cases where that could happen are already covered:
+  - *Old candidate-color tasks still running while the candidate is redeployed (P0).* The candidate owns no groups, and acceptance isn't enabled until the P0 gate confirms in ECS that the deployment has completed with only the new task definition running.
+  - *A retired color restarted later.* It owns nothing, so it consumes nothing. It can only own groups again after being redeployed and validated as a candidate.
+  - *An out-of-band update or ECS circuit-breaker rollback of a color mid-rollout.* This is the one real case, and a runtime check in containers would only turn it into a different incident: the owning color's consumers would stop one by one as its tasks were replaced. Preventing and detecting it at the platform level is better (next bullet).
+- **Prevent and detect.** IAM allows only the pipeline role to update color services. Before every step the orchestrator checks each color's service in ECS: task-definition revision, deployment state, no circuit-breaker rollback, every running task on the expected revision. It also watches ECS deployment events for the duration of the rollout. Optionally, include the build version in `client.id` so the Kafka membership check also confirms that every group member runs the expected build.
+- **A mid-rollout change to a color's service is a new rollout.** A hotfix, a config or secret change that produces a new task-definition revision, or a circuit-breaker rollback: the orchestrator aborts (hands groups back to Blue if Green owns any, sets API weight back to Blue) and restarts from P0. A fix that can't wait goes through the same pipeline with shortened bake windows.
+- Keep the retired color's service at zero between rollouts, and alarm if it scales up outside a rollout.
 
 ### 9.3 Startup sequence
 
 1. Read `STACK_COLOR`, `DEPLOYMENT_ID` and `STACK_ID`. If any is missing, exit non-zero; a container without an identity must never consume.
 2. Start the Spring context and the HTTP server. The LB readiness check covers only what the API needs.
 3. After a small random delay (0–2 s), read the control item with a consistent read. Until the first successful read, run no consumers.
-4. Apply deployment-id fencing, then converge. Every functional container is created with the ownership guard (section 9.6), so a container that started from a stale read cannot process records it shouldn't.
-5. Write the status item: deployment id, observed `rev`, running containers, orphan flag.
+4. Converge. Every functional container is created with the ownership guard (section 9.6), so a container that started from a stale read cannot process records it shouldn't.
+5. Write the status item: observed `rev` and running containers.
 
 ```yaml
 management:
@@ -872,12 +869,12 @@ management:
         enabled: true
       group:
         readiness:                 # ALB target group health check / Kubernetes readiness probe
-          include: readinessState, identity, db, kafkaProducer
+          include: readinessState, db, kafkaProducer
         consumers:                 # read by the orchestrator and dashboards, never by the LB
           include: kafkaConsumers, controlPlane
 ```
 
-`identity`, `kafkaProducer`, `kafkaConsumers` and `controlPlane` are custom `HealthIndicator` beans. `identity` is DOWN only for a confirmed orphan; an unknown identity (control plane not yet reachable) stays UP, so a DynamoDB blip during scale-out doesn't shrink API capacity. Consumers stay out of LB readiness because a container whose consumers are intentionally off (non-owner color, or waiting for the control plane) must still serve the API traffic routed to it.
+`kafkaProducer`, `kafkaConsumers` and `controlPlane` are custom `HealthIndicator` beans. `controlPlane` stays out of LB readiness so a DynamoDB blip during scale-out doesn't shrink API capacity. Consumers stay out of LB readiness because a container whose consumers are intentionally off (non-owner color, or waiting for the control plane) must still serve the API traffic routed to it.
 
 Newly started containers process their first records more slowly (JIT, connection pools, caches). Lag gates should allow for that; pre-scaled Green containers are already warm from acceptance traffic.
 
@@ -909,7 +906,7 @@ When there's no grace (SIGKILL, OOM, host loss), uncommitted records are redeliv
 | Partition-canary window | Desired count frozen | Desired count frozen |
 | P3–P4 | Scale-in suspended; scale-out allowed | Floor raised to at least Blue's baseline (plus headroom) before the API ramp, since Green will carry all API and consumer load |
 | P5 bake | Scale-in only once measured traffic is near zero; keep a warm floor for the rollback window | Normal autoscaling |
-| After bake | Scaled to zero; orphan alarm armed | Normal autoscaling; Green is now live |
+| After bake | Scaled to zero; alarm if it scales up outside a rollout | Normal autoscaling; Green is now live |
 | Any rollback | Restored to the baseline before any weight change or group handback | Pinned at its current count until offset fences pass and groups are handed back |
 
 - **Record the baseline.** At P0 the orchestrator stores Blue's current desired and minimum capacity in the control item (`capacityBaseline`), so a resumed pipeline or a rollback knows what full capacity was.
@@ -924,11 +921,11 @@ When there's no grace (SIGKILL, OOM, host loss), uncommitted records are redeliv
 
 | # | When | Event | Risk | Handling |
 |---|---|---|---|---|
-| S1 | P0 | Green containers still launching when P1 begins | Late joiners rebalance acceptance groups during the test run | P0 exit gate: Green at its target count, every container reports the candidate deployment id and current `rev`. Green capacity fixed during P1. |
-| S2 | P0 | The candidate color's service still runs tasks from an earlier rollout | Old code joins functional groups later, when this color becomes owner | Deployment-id fencing makes them orphans; the P0 exit gate requires zero orphans. Keep the retired color's service at zero between rollouts. |
-| S3 | P1 | A Green container crashes or is replaced during acceptance | Test records delayed or redelivered; flaky gate | The replacement rejoins the same acceptance group (same deployment id). Assertions are time-boxed and tolerate redelivery; the harness waits for a stable group before each batch. |
+| S1 | P0 | Green containers still launching when P1 begins | Late joiners rebalance acceptance groups during the test run | P0 exit gate: Green's ECS deployment completed with only the new task definition running, at its target count, and every container reports the current `rev`. Green capacity fixed during P1. |
+| S2 | P0 | The candidate color's service still runs tasks from an earlier rollout | Old code reading acceptance records or, later, functional groups | The candidate owns no groups during P0, and acceptance isn't enabled until the P0 gate confirms in ECS that only the new task definition is running. Keep the retired color's service at zero between rollouts. |
+| S3 | P1 | A Green container crashes or is replaced during acceptance | Test records delayed or redelivered; flaky gate | The replacement rejoins the same acceptance group (same task definition, same group name). Assertions are time-boxed and tolerate redelivery; the harness waits for a stable group before each batch. |
 | S4 | P1 | Blue (live) scales out | None beyond a normal rebalance | New Blue containers run their functional groups and, if enabled, Blue's acceptance groups for M3. |
-| S5 | P1–P4 | Green's service changes mid-rollout (hotfix, config or secret revision, ECS circuit-breaker rollback) | Two Green builds side by side; untested code consuming or serving | New tasks carry a different deployment id and become orphans. The orchestrator aborts: groups back to Blue if Green owns any, API weight back to Blue, restart from P0 with the new deployment id. |
+| S5 | P1–P4 | Green's service changes mid-rollout (hotfix, config or secret revision, ECS circuit-breaker rollback) | Two Green builds side by side; untested code consuming or serving | Pipeline-only IAM on color services prevents manual changes; the orchestrator watches ECS deployment events and aborts on any change: groups back to Blue if Green owns any, API weight back to Blue, restart from P0. |
 | S6 | P2, owner `NONE` | A Blue container starts | A stale read from just before `NONE` lets it join after the group looked empty | Re-read before start, ownership guard on assignment, settle window with a second Kafka check. |
 | S7 | P2, owner `NONE` | A draining Blue container is killed (SIGKILL, OOM, host loss) | No commit; partitions held until the session times out; redelivery to Green | Stop timeout above the drain budget; the orchestrator waits at least `session.timeout.ms` before aborting; idempotency. |
 | S8 | P2, owner `NONE` | Blue uses static membership | Stopped static members stay in the group until the session times out, so the group never looks empty | Remove them with `removeMembersFromConsumerGroup` once status items confirm the drain, or don't use static membership for these groups. |
@@ -942,7 +939,7 @@ When there's no grace (SIGKILL, OOM, host loss), uncommitted records are redeliv
 | S16 | P4 | Blue containers are scaled in as traffic leaves | In-flight produces lost if the API responds before the send is acknowledged; rollback capacity shrinks | Ack-before-respond or outbox; producer flush on shutdown; Blue scale-in stays suspended until the bake ends. |
 | S17 | P4 | A new Green container passes LB health checks before its consumers converge | None, by design | LB readiness covers the API only; consumer readiness is reported separately. |
 | S18 | P4–P5 | Blue still receives requests after its weight reaches 0 (DNS caches, long-lived connections) | Scaling Blue to zero early causes client errors | Retire Blue on its measured `RequestCount` staying near zero for a sustained window, not on the configured weight. |
-| S19 | P5 and later | A stray Blue container starts (desired count left above zero, platform replacement) | Old code consuming | Green owns every group and, once the next rollout starts, the old deployment id no longer matches: no consumers either way. Orphan alarm. |
+| S19 | P5 and later | A stray Blue container starts (desired count left above zero, platform replacement) | Old code consuming | Green owns every group, so the Blue container runs no consumers; Blue can only own groups again after being redeployed and validated as a candidate. Alarm on the retired color scaling up outside a rollout. |
 | S20 | Rollback R1/R3 | Blue was already scaled down | Groups handed back onto too few containers; lag surge | Restore Blue to the baseline, wait until all Blue containers report the current `rev`, then shift weights or hand back groups. |
 | S21 | Rollback R3, fence wait | Green scales in as API traffic leaves | Fewer consumers; the fence takes longer to pass | Keep Green's floor pinned until groups are handed back. |
 | S22 | Any phase | AZ outage, spot interruption or platform patching replaces many containers at once | Rebalance storms; a handover started in the middle of one | Handover steps require a stable group; the first control-plane read is jittered; the shutdown budget fits inside the interruption notice. |
@@ -955,7 +952,7 @@ When there's no grace (SIGKILL, OOM, host loss), uncommitted records are redeliv
 A container that read the control item just before an ownership change can start a functional container after it should have stayed off (S6). Three layers close that window:
 
 1. **Re-read before start.** The reconciler re-reads the control item immediately before `container.start()` and skips the start if `rev` has changed.
-2. **Ownership guard on assignment.** When partitions are assigned, the container confirms with a fresh consistent read that its color and deployment id still own the group. If they don't, it pauses the partitions and stops itself, so it processes nothing.
+2. **Ownership guard on assignment.** When partitions are assigned, the container confirms with a fresh consistent read that its color still owns the group. If they don't, it pauses the partitions and stops itself, so it processes nothing.
 3. **Settle window.** The orchestrator re-checks Kafka membership one poll interval plus container start time after the group first looks empty, and again after Green takes over (section 4.2.5).
 
 ```java
@@ -975,7 +972,6 @@ class OwnershipGuards {
                 boolean owner;
                 try {
                     // Consistent read, cached for ~1 s so concurrent threads share it.
-                    // owns() checks both color and deployment id.
                     owner = controlPlane.readFresh().owns(me, spec.consumerName());
                 } catch (Exception e) {
                     owner = true;   // can't tell: stay fail-static; the orchestrator's Kafka check still applies
@@ -996,14 +992,14 @@ Pausing on the raw consumer inside the callback keeps the current poll from fetc
 
 | Strategy | Effect of containers joining or leaving | Most dangerous moment | Required handling | Overall |
 |---|---|---|---|---|
-| Hardened provided strategy | Late joiners converge from the control item; joins and leaves rebalance only the owning color's members | A stale joiner during a handover; Blue scale-in during the API ramp | Deployment-id fencing, the three stale-joiner defenses, capacity floors and suspensions | Good |
+| Hardened provided strategy | Late joiners converge from the control item; joins and leaves rebalance only the owning color's members | A stale joiner during a handover; Blue scale-in during the API ramp | Pipeline-only service changes checked in ECS, the three stale-joiner defenses, capacity floors and suspensions | Good |
 | A. Partition canary | The canary share is a function of member counts, so every join or leave shifts it and can move keys between versions | Autoscaling or a crash during the overlap window | Freeze desired counts; measure Green's real partitions; a custom assignor pins partitions regardless of churn, but only on the classic protocol | Poor unless capacity is frozen |
 | B. Shadow + handover | Shadow-group churn doesn't touch production groups | A new container coming up with real sinks; shadow containers starting before offsets are seeded | Container-scoped, default-deny sink mode; `auto.offset.reset=none` on the shadow group, seeded before shadowing is enabled in the control item; run shadow as its own service so it scales and fails independently | Good, if isolation is enforced |
 | C. Cohort routing | Membership doesn't affect which color processes which record | A container acting on a stale epoch list | Fail closed, with a freshness lease checked per batch; fences far enough ahead that every container learns a new epoch before it applies; each color sized to read 100% of the stream | Best for membership churn, most fragile to stale config |
 | D. Versioned topics | Consumers on each version scale independently | Bridge instance churn: task migration, aborted transactions | Standby replicas for the bridge; stable transactional ids; bridge capacity floors during cutover | Good; the bridge is an extra moving part |
 | Baseline rolling | Which version handles a key depends on which tasks happen to be replaced | Any scaling event during the roll | None available | Uncontrolled |
 
-Churn reinforces the recommendation in section 7. The hardened strategy already derives every container's role from the control item and verifies against Kafka, so it only needs fencing, the stale-joiner defenses and capacity rules on top. A partition canary should run only with frozen capacity. Cohort routing tolerates membership changes best, but it moves the risk to configuration freshness, which is harder to guarantee for containers that start at arbitrary times.
+Churn reinforces the recommendation in section 7. The hardened strategy already derives every container's role from the control item and verifies against Kafka, so it only needs the stale-joiner defenses, locked-down color services and capacity rules on top. A partition canary should run only with frozen capacity. Cohort routing tolerates membership changes best, but it moves the risk to configuration freshness, which is harder to guarantee for containers that start at arbitrary times.
 
 ### 9.8 Kafka client settings that interact with churn
 
@@ -1035,7 +1031,7 @@ Tag every metric with `color`, `deployment.id` and `build` (Micrometer common ta
 | Business KPIs | Domain metrics (e.g. orders completed per minute) | Relative to the same window on previous days. |
 | Test-record leak counter | Functional-path `RecordInterceptor` | Must be zero; any increment aborts. |
 | Control-plane health | Reconciler metrics (read failures, `observedRev` spread) | The orchestrator never advances while any instance is behind. |
-| Orphan containers and deployment-id mix per color | Status items, task metadata | Zero orphans before P1 and before every handover step. |
+| Task-definition revisions running per color | ECS service and task metadata | Exactly one, the expected revision, before P1 and before every handover step. |
 | Capacity versus baseline per color | Autoscaling target state | Blue at baseline before any rollback step; Green pinned through P2–P4. |
 | Ungraceful terminations | Platform task-stop reasons, missing shutdown logs | A spike during a rollout holds the pipeline: it means redelivery and slower handovers. |
 
@@ -1049,9 +1045,9 @@ Tag every metric with `color`, `deployment.id` and `build` (Micrometer common ta
 
 | Step | Work | Notes |
 |---|---|---|
-| **1. Enabling release** (ships as a normal deployment) | Color and deployment-id injection; color-scoped `client.id`, `transactional.id` and metric tags. Reconciler that, when no control item exists, behaves exactly as today. Test-routing contract (publisher choke point, headers, acceptance topics, context propagation, leak guards). Acceptance container mode with deployment-id filtering. Idempotency keys wherever missing. Container lifecycle hardening: deployment-id fencing, ownership guard, `SmartLifecycle` shutdown ordering, split health groups, ack-before-respond on API paths that produce. | This release becomes the first N-1 that supports the new flow. |
-| **2. Infrastructure** | Acceptance topics per functional topic. ACLs or MSK IAM policies that allow `*.acc.*` and `*.shadow.*` group names. Schema-registry compatibility modes or the golden-corpus pipeline. Per-color internal endpoints for the harness. Route 53 health checks and low TTL, or a shared ALB with weighted target groups. | Can proceed in parallel with step 1. |
-| **3. Orchestrator** | Resumable state machine; conditional control-item writes; AdminClient verifier with settle windows; offset snapshotter; capacity control (baselines, floors, scaling suspensions); weight stepper; alarm evaluation; automated R1–R4. | Step Functions or your existing CD tool. |
+| **1. Enabling release** (ships as a normal deployment) | Color and deployment-id injection; color-scoped `client.id`, `transactional.id` and metric tags. Reconciler that, when no control item exists, behaves exactly as today. Test-routing contract (publisher choke point, headers, acceptance topics, context propagation, leak guards). Acceptance container mode with target-color filtering. Idempotency keys wherever missing. Container lifecycle hardening: ownership guard, `SmartLifecycle` shutdown ordering, split health groups, ack-before-respond on API paths that produce. | This release becomes the first N-1 that supports the new flow. |
+| **2. Infrastructure** | Acceptance topics per functional topic. ACLs or MSK IAM policies that allow `*.acc.*` and `*.shadow.*` group names. Schema-registry compatibility modes or the golden-corpus pipeline. Per-color internal endpoints for the harness. IAM so only the pipeline role can update color services. Route 53 health checks and low TTL, or a shared ALB with weighted target groups. | Can proceed in parallel with step 1. |
+| **3. Orchestrator** | Resumable state machine; conditional control-item writes; AdminClient verifier with settle windows; ECS service-state checks and deployment-event watch; offset snapshotter; capacity control (baselines, floors, scaling suspensions); weight stepper; alarm evaluation; automated R1–R4. | Step Functions or your existing CD tool. |
 | **4. First rollout** | One low-traffic region, one stack, groups flipped one at a time with manual approvals. | Use it to calibrate bake windows and thresholds. |
 | **5. Expand** | All regions in waves; automated gates; partition canary for high-risk groups; shadow mode for flagged releases. | Revisit cohort routing only if tenant-pinned end-to-end canaries become a requirement. |
 
@@ -1069,7 +1065,7 @@ Tag every metric with `color`, `deployment.id` and `build` (Micrometer common ta
 | `client.id` | `<service>-<color>-<consumer>` | `orders-green-order-events` (Spring appends `-0`, `-1`, …) |
 | `transactional.id` prefix | `<service>-<color>-<instance>-` | `orders-green-ip-10-2-3-4-` |
 | `group.instance.id` (static membership) | `<service>-<color>-<instance>-<consumer>` | `orders-green-i-0a1b2c3d-order-events` |
-| Test headers | `x-test-run-id`, `x-test-target` | `x-test-target: d-20261026-7f3c` |
+| Test headers | `x-test-run-id`, `x-test-target` | `x-test-target: green` |
 
 ## Appendix B — Verification snippets
 
